@@ -164,7 +164,7 @@ function restoreDatabase(array $config): void
     }
 
     // Check if the dump file might be in UTF16LE format
-    if(isUtf16($config['dumpFilePath'])) {
+    if (isUtf16($config['dumpFilePath'])) {
         log_message("Detected UTF16LE encoding in the dump file, converting to UTF8 for import...");
         log_message("Please use the --repair option to convert the dump file to UTF8 first.");
         exit(1);
@@ -301,20 +301,18 @@ function normalizeDumpFile($config): bool
 
     // Check if the file is large
     $filesizeInMB = round(filesize($config['dumpFilePath']) / 1024 / 1024, 0);
-    $largeFile = $filesizeInMB > 50;
-    if ($largeFile) {
-        log_message($config['dumpFilePath'] . " is large: ". $filesizeInMB ." MB");
+    if ($filesizeInMB > 50) {
+        log_message($config['dumpFilePath'] . " is large: " . $filesizeInMB . " MB");
     }
 
-    // Open source/target
-    $sourceHandle = fopen($config['dumpFilePath'], 'r');
-    if ($sourceHandle === false) {
+    // Open source file
+    if (!($sourceHandle = fopen($config['dumpFilePath'], 'r'))) {
         log_message("Failed to open source file: $config[dumpFilePath]");
         return false;
     }
 
-    $targetHandle = fopen($config['tempFilePath'], 'w');
-    if ($targetHandle === false) {
+    // Open target file
+    if (!($targetHandle = fopen($config['tempFilePath'], 'w'))) {
         fclose($sourceHandle);
         log_message("Failed to open target file: $config[tempFilePath]");
         return false;
@@ -325,10 +323,9 @@ function normalizeDumpFile($config): bool
 
     // Initialize loop state
     $lineCount = 0;
-    $currentTable = '';
     $inInsertStatement = false;
-    $valuesBuffer = [];
-    $currentLine = '';
+    $valueBlocks = [];
+    $insertStmt = '';
     $startTime = microtime(true);
 
     // Read lines
@@ -338,74 +335,88 @@ function normalizeDumpFile($config): bool
 
         logProgress($lineCount, $startTime);
 
-        if(!$inInsertStatement) {
+        // Handle INSERT mode
+        if ($inInsertStatement) {
 
-            // Skip lines we don’t want (comments, empties, db statements, etc.)
-            if (shouldSkipLine($line)) {
+            // Check if line contains value blocks
+            $trimmedLine = trim($line);
+
+            // Check if line contains value blocks (starts with a parenthesis or contains value blocks)
+            if (preg_match('/^\s*\(/', $trimmedLine) || preg_match('/\)\s*,\s*\(/', $trimmedLine)) {
+                // Handle multiple value blocks in a single line
+                $parsedBlocks = parseValueBlocks($trimmedLine);
+                if (!empty($parsedBlocks)) {
+                    $valueBlocks = array_merge($valueBlocks, $parsedBlocks);
+                }
+
+                // End of VALUES detection
+                if (preg_match('/\);\s*$/', $trimmedLine)) {
+                    writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
+                    $inInsertStatement = false;
+                }
                 continue;
             }
 
-            // Transform line in various ways (remove DEFINER, AUTO_INCREMENT, etc.)
-            $line = transformLine($line);
+            // End of INSERT detection
+            if (preg_match('/;\s*$/', $trimmedLine) || !preg_match('/^\s*\(/i', $trimmedLine)) {
+                if (!empty($valueBlocks)) {
+                    writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
+                }
 
+                $inInsertStatement = false;
+                if (!preg_match('/^\s*;\s*$/', $trimmedLine)) {
+                    fwrite($targetHandle, $line);
+                }
+                continue;
+            }
+
+            continue;
         }
+
+        // Skip lines we don’t want (comments, empties, db statements, etc.)
+        if (shouldSkipLine($line)) {
+            continue;
+        }
+
+        // Transform line in various ways (remove DEFINER, AUTO_INCREMENT, etc.)
+        $line = transformLine($line);
 
         // Detect start of an INSERT statement
         if (preg_match('/^INSERT INTO `([^`]+)`(\s+VALUES|\s+\([^)]+\)\s+VALUES)\s*\(?/', $line, $matches)) {
             $inInsertStatement = true;
-            $currentTable = $matches[1];
-            $currentLine = "INSERT INTO `$currentTable` VALUES\n";
-            $valuesBuffer = [];
+            $insertStmt = "INSERT INTO `{$matches[1]}` VALUES\n";
+            $valueBlocks = [];
 
-            // Extract the first VALUES block(s) on this same line
-            if (preg_match('/VALUES\s*(\(.*)/i', $line, $valuesMatch)) {
-                $valueStr = rtrim($valuesMatch[1], " \t\n\r\0\x0B;");
-                $valuesBuffer = array_merge($valuesBuffer, parseValueBlocks($valueStr));
+            // Extract VALUES on same line
+            if (preg_match('/VALUES\s*(\(.*)/i', $line, $values)) {
+                $valueStr = rtrim($values[1], " \t\n\r\0\x0B;");
+                $valueBlocks = parseValueBlocks($valueStr);
+
+                // One-liner INSERT
+                if (preg_match('/\);\s*$/', $line)) {
+                    writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
+                    $inInsertStatement = false;
+                }
             }
             continue;
         }
 
-        // Collect VALUES blocks for consolidation
-        if ($inInsertStatement && preg_match('/^\s*\(/', $line)) {
-            $cleanLine = trim($line);
-            $valuesBuffer = array_merge($valuesBuffer, parseValueBlocks($cleanLine));
-            continue;
+        // Write normal line with table spacing
+        if (str_starts_with($line, '-- Table structure for table')) {
+            fwrite($targetHandle, "\n");
         }
-
-        // End of an INSERT statement => consolidate
-        if ($inInsertStatement && (preg_match('/;\s*$/', $line) || preg_match('/^[^(]/', $line))) {
-            $inInsertStatement = false;
-            if (!empty($valuesBuffer)) {
-                writeConsolidatedInsert($targetHandle, $currentLine, $valuesBuffer);
-            }
-            // If there's something else on this line that isn't just `;`, write it
-            if (!preg_match('/;\s*$/', $line)) {
-                fwrite($targetHandle, $line);
-            }
-            continue;
-        }
-
-        // Normal line (no INSERT statements)
-        if (!$inInsertStatement) {
-            if (str_starts_with($line, '-- Table structure for table')) {
-                fwrite($targetHandle, "\n");
-            }
-            fwrite($targetHandle, $line);
-        }
+        fwrite($targetHandle, $line);
     }
 
+    // Handle any remaining INSERT data
+    if ($inInsertStatement && !empty($valueBlocks)) {
+        writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
+    }
+
+    // Cleanup
     fclose($sourceHandle);
-    
-    // Handle any remaining buffered values if the file ended during an INSERT statement
-    if ($inInsertStatement && !empty($valuesBuffer)) {
-        writeConsolidatedInsert($targetHandle, $currentLine, $valuesBuffer);
-    }
-    
     fclose($targetHandle);
-
-    // Replace the original with the processed version
     rename($config['tempFilePath'], $config['dumpFilePath']);
-
     log_message("Processed $lineCount lines total");
 
     return true;
@@ -479,13 +490,13 @@ function shouldSkipLine(string $line): bool
 function transformLine(string $line): string
 {
     $replacements = [
-        '/DEFINER=`[^`]+`@`[^`]+`\s*/'                      => '',         // Remove DEFINER clauses
-        '/\s+AUTO_INCREMENT=\d+/'                           => '',         // Remove AUTO_INCREMENT
-        '/\butf8\b/'                                        => 'utf8mb4',  // Replace utf8 with utf8mb4 (whole word only)
-        '/\b(tiny|small|medium|big)?int\(\d+\)/'            => '$1int',    // Convert int(N) to int, tinyint(N) to tinyint, etc.
-        '/\s+COLLATE\s+[\'"]?[a-zA-Z0-9_]+[\'"]?/'          => '',         // Remove COLLATE in column definitions
-        '/\s+COLLATE\s*=\s*[\'"]?[a-zA-Z0-9_]+[\'"]?/'      => '',         // Remove COLLATE in table definitions
-        '/(=\s*)(\'(\d+(\.\d+)?)\')/i'                      => '$1$3',     // Remove quotes from numeric literals
+        '/DEFINER=`[^`]+`@`[^`]+`\s*/' => '',         // Remove DEFINER clauses
+        '/\s+AUTO_INCREMENT=\d+/' => '',         // Remove AUTO_INCREMENT
+        '/\butf8\b/' => 'utf8mb4',  // Replace utf8 with utf8mb4 (whole word only)
+        '/\b(tiny|small|medium|big)?int\(\d+\)/' => '$1int',    // Convert int(N) to int, tinyint(N) to tinyint, etc.
+        '/\s+COLLATE\s+[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',         // Remove COLLATE in column definitions
+        '/\s+COLLATE\s*=\s*[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',         // Remove COLLATE in table definitions
+        '/(=\s*)(\'(\d+(\.\d+)?)\')/i' => '$1$3',     // Remove quotes from numeric literals
     ];
 
     foreach ($replacements as $pattern => $replacement) {
@@ -502,30 +513,32 @@ function transformLine(string $line): string
 function parseValueBlocks(string $lineFragment): array
 {
     $blocks = [];
-    
+    $lineFragment = trim($lineFragment);
+
+    // Remove any trailing semicolon or comma
+    $lineFragment = rtrim($lineFragment, ',;');
+
     // If we see multiple row blocks in one string => split them
     if (str_contains($lineFragment, '),(')) {
         $parts = preg_split('/\),\s*\(/', $lineFragment);
         foreach ($parts as $i => $part) {
             $part = trim($part);
 
-            // Remove trailing semicolon if present
-            if ($i === count($parts) - 1 && str_ends_with($part, ';')) {
-                $part = substr($part, 0, -1);
-            }
+            // Remove any trailing commas first
+            $part = rtrim($part, ',');
 
-            // Add missing parentheses carefully
+            // Add missing parentheses
             if ($i === 0) {
-                // First part - may already have opening parenthesis
+                // The First part - it may already have opening parenthesis
                 if (!str_starts_with($part, '(')) {
                     $part = '(' . $part;
                 }
-                // Always add a closing parenthesis, but first check if it already has one
+                // Add closing parenthesis if missing
                 if (!str_ends_with($part, ')')) {
                     $part .= ')';
                 }
             } elseif ($i === count($parts) - 1) {
-                // Last part - always add opening and closing parentheses if missing
+                // Last part - add opening and closing if missing
                 if (!str_starts_with($part, '(')) {
                     $part = '(' . $part;
                 }
@@ -545,9 +558,8 @@ function parseValueBlocks(string $lineFragment): array
         }
     } else {
         // Single row block
-        if (str_ends_with($lineFragment, ',') || str_ends_with($lineFragment, ';')) {
-            $lineFragment = substr($lineFragment, 0, -1);
-        }
+        $lineFragment = rtrim($lineFragment, ',;');
+
         // Ensure it has opening and closing parentheses
         if (!str_starts_with($lineFragment, '(')) {
             $lineFragment = '(' . $lineFragment;
@@ -577,7 +589,7 @@ function writeConsolidatedInsert($targetHandle, string $insertHeader, array $val
     foreach ($valuesBuffer as $valueBlock) {
         // Remove trailing comma if present to prevent double commas
         $valueBlock = rtrim($valueBlock, ",");
-        
+
         if (strlen($currentValueLine . $valueBlock) > $maxLineLength) {
             if (!empty($currentValueLine)) {
                 $consolidatedValues[] = $currentValueLine;
@@ -595,7 +607,7 @@ function writeConsolidatedInsert($targetHandle, string $insertHeader, array $val
     }
 
     // When we join the lines, we need to make sure the last line in each group
-    // doesn't have a trailing comma (which would create the ",)" pattern)
+    // doesn't have a trailing comma, which would create the ",)" pattern
     if (!empty($consolidatedValues)) {
         for ($i = 0; $i < count($consolidatedValues) - 1; $i++) {
             if (!str_ends_with($consolidatedValues[$i], ",")) {
@@ -605,7 +617,7 @@ function writeConsolidatedInsert($targetHandle, string $insertHeader, array $val
         // Make sure the last item doesn't have a trailing comma
         $consolidatedValues[count($consolidatedValues) - 1] = rtrim($consolidatedValues[count($consolidatedValues) - 1], ",");
     }
-    
+
     fwrite($targetHandle, implode("\n", $consolidatedValues));
 
     // Ensure we end with a semicolon
@@ -636,7 +648,7 @@ function logFileStats(string $filePath): void
         log_message("File not found: $filePath");
         return;
     }
-    
+
     $size = filesize($filePath);
     log_message("Database file statistics:");
     log_message("- Path: $filePath");
@@ -649,12 +661,12 @@ function logFileStats(string $filePath): void
 function formatBytes(int $bytes, int $precision = 2): string
 {
     $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    
+
     $bytes = max($bytes, 0);
     $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
     $pow = min($pow, count($units) - 1);
-    
+
     $bytes /= (1 << (10 * $pow));
-    
+
     return round($bytes, $precision) . ' ' . $units[$pow];
 }
