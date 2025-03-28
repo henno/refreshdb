@@ -14,7 +14,24 @@ For that, it offers three modes:
 2. **Restore** – Restore `doc/database.sql` into a (freshly dropped and re-created) database.
 3. **Repair** – Take an existing `doc/database.sql` and apply the same cleanup/normalization rules as with --dump.
 
-## 2. Usage
+## 2. Installation
+
+### Windows
+
+You can use the PowerShell installation script to set up RefreshDB on Windows:
+
+1. Run the following command in PowerShell:
+   ```powershell
+   Invoke-Expression (Invoke-WebRequest -Uri https://raw.githubusercontent.com/henno/refreshdb/main/INSTALL.ps1 -UseBasicParsing).Content
+   ```
+
+This will:
+- Add `$HOME\bin` to your PATH if it's not already included
+- Create the bin directory if it doesn't exist
+- Download the latest refreshdb.php script to your bin directory
+- Create a wrapper batch file (db.bat) so you can run the tool with just `db [options]`
+
+## 3. Usage
 
 ```bash
 php refreshdb.php [--dump | --restore | --repair]
@@ -22,7 +39,7 @@ php refreshdb.php [--dump | --restore | --repair]
 
 You can only use one mode at a time. If no mode is specified, the script will show usage information.
 
-## 3. Reading Database Credentials
+## 4. Reading Database Credentials
 
 - If `config.php` is present, parse out `DATABASE_USERNAME`, `DATABASE_HOSTNAME`, `DATABASE_DATABASE`, and `DATABASE_PASSWORD`.
 - If `DATABASE_PASSWORD` is empty, the -p flag will be omitted from the commands.
@@ -31,7 +48,7 @@ You can only use one mode at a time. If no mode is specified, the script will sh
 - If `config.php` is missing, look for WordPress-style `DB_` prefixed constants. Same parsing logic as above.
 - If neither file is found or needed constants can't be read, output an error and exit.
 
-## 4. Dumping & Repairing
+## 5. Dumping & Repairing
 
 Both **`--dump`** and **`--repair`** perform the **same normalization/cleanup** on the SQL output:
 
@@ -47,7 +64,7 @@ Both **`--dump`** and **`--repair`** perform the **same normalization/cleanup** 
     - **Streaming**: Reads by line and replaces text before writing the line to disk, to avoid running out of memory.
     - **Output**: Overwrites `doc/database.sql` with the cleaned version (identical to what `--dump` would produce).
 
-### 4.1 Normalization Rules for `--dump` and `--repair`
+### 5.1 Normalization Rules for `--dump` and `--repair`
 
 - Adds Current DateTime and host name to the top of the file as comments.
 - Adds `SET FOREIGN_KEY_CHECKS=0;` and `SET @@SESSION.sql_mode='NO_AUTO_VALUE_ON_ZERO';` to avoid interdependency problems and ensure consistent handling of zero values in auto-increment fields.
@@ -65,21 +82,21 @@ Both **`--dump`** and **`--repair`** perform the **same normalization/cleanup** 
 - Removes `DROP TABLE IF EXISTS` from CREATE TABLE statements (restoring starts with a fresh database).
 - Removes `/*M!999999\- enable the sandbox mode */` line (this is a comment that is not supported by older versions of MariaDB).
 
-## 5. Restore Mode
+## 6. Restore Mode
 
 - Drops the database if it exists and creates it. This prevents leftover tables not in the dump.
 - Reads from `doc/database.sql` (configurable).
 - Uses `--binary-mode` to ensure binary data is not misread.
 - Does not do any transformations to the SQL during restore.
 
-## 6. Logging & Progress
+## 7. Logging & Progress
 
 - Outputs total time spent at the end.
 - Logs executed commands to help with debugging and troubleshooting.
 - Each log is prefixed with `[0.0]` where the number is the total time spent in seconds since the start of the script.
 - If any errors occur, they're printed and the script exits with a non-zero status code.
 
-## 7. Configuration
+## 8. Configuration
 
 The script uses default paths and settings that can be modified in the source code:
 - Default input/output path: `doc/database.sql`
