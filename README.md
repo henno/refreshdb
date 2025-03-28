@@ -20,14 +20,16 @@ For that, it offers three modes:
 php refreshdb.php [--dump | --restore | --repair]
 ```
 
+You can only use one mode at a time. If no mode is specified, the script will show usage information.
+
 ## 3. Reading Database Credentials
 
-- If `config.php` is present, parse out `DATABASE_USERNAME`, `DATABASE_HOSTNAME`, `DATABASE_DATABASE`.
-- If DATABASE_PASSWORD is empty, the -p flag will be omitted from the commands.
+- If `config.php` is present, parse out `DATABASE_USERNAME`, `DATABASE_HOSTNAME`, `DATABASE_DATABASE`, and `DATABASE_PASSWORD`.
+- If `DATABASE_PASSWORD` is empty, the -p flag will be omitted from the commands.
 - Allow for varied quoting (single/double) and spacing.
 - Both `const` and `define()` forms are possible.
 - If `config.php` is missing, look for WordPress-style `DB_` prefixed constants. Same parsing logic as above.
-- If neither file is found or needed constants can’t be read, output an error and exit.
+- If neither file is found or needed constants can't be read, output an error and exit.
 
 ## 4. Dumping & Repairing
 
@@ -48,31 +50,37 @@ Both **`--dump`** and **`--repair`** perform the **same normalization/cleanup** 
 ### 4.1 Normalization Rules for `--dump` and `--repair`
 
 - Adds Current DateTime and host name to the top of the file as comments.
-- Adds `SET FOREIGN_KEY_CHECKS=0;` to avoid interdependency problems while restoring tables.
+- Adds `SET FOREIGN_KEY_CHECKS=0;` and `SET @@SESSION.sql_mode='NO_AUTO_VALUE_ON_ZERO';` to avoid interdependency problems and ensure consistent handling of zero values in auto-increment fields.
 - Converts `int(11)` to `int`, etc. (remove length parentheses) to make output consistent.
 - Removes quotes from numeric literals like '1' or "0" to make output consistent.
 - Omits any `COLLATE` clauses to get around MySQL and MariaDB collation name differences.
 - Replaces `utf8` (whole word only) with `utf8mb4` to make output consistent.
 - Removes all `DEFINER` references from triggers, procedures, etc. because they will cause errors when restoring to a
-  different database that doesn’t have the same user.
-- Consolidates all VALUE blocks of INSERT INTOs onto as few lines as possible, with each line up to a maximum of 220
-  characters (it is very important not to exceed 220-characters per line limit). If adding another VALUE block would
-  exceed that limit, places it on a new line. Keeps each VALUE block intact (does not split it into multiple lines).
+  different database that doesn't have the same user.
+- Consolidates all VALUE blocks of INSERT INTOs onto as few lines as possible, while not exceeding a configured maximum
+  line length (120 characters by default). If adding another VALUE block would exceed that limit, places it on a new line. Keeps each
+  VALUE block intact (does not split it into multiple lines).
 - Removes `AUTO_INCREMENT` from `CREATE TABLE` statements.
-- Removes all Mysqldump comments.
-- Removes DROP TABLE IF NOT EXISTS from CREATE TABLE statements (restoring starts with a fresh database).
-- Removes /*M!999999\- enable the sandbox mode */ line
+- Removes all Mysqldump comments (including "MySQL dump", "Dump", "Server version", "Dump completed on", "MariaDB dump", "Host:", "Current Database:", and separator lines).
+- Removes `DROP TABLE IF EXISTS` from CREATE TABLE statements (restoring starts with a fresh database).
+- Removes `/*M!999999\- enable the sandbox mode */` line (this is a comment that is not supported by older versions of MariaDB).
 
-## 5. Restore mode
+## 5. Restore Mode
 
 - Drops the database if it exists and creates it. This prevents leftover tables not in the dump.
-- Reads from `doc/database.sql`
+- Reads from `doc/database.sql` (configurable).
 - Uses `--binary-mode` to ensure binary data is not misread.
-- Does not do any transformations
+- Does not do any transformations to the SQL during restore.
 
 ## 6. Logging & Progress
 
 - Outputs total time spent at the end.
-- Logs executed commands to help with debugging.
+- Logs executed commands to help with debugging and troubleshooting.
 - Each log is prefixed with `[0.0]` where the number is the total time spent in seconds since the start of the script.
-- If any errors occur, they’re printed and the script exits.
+- If any errors occur, they're printed and the script exits with a non-zero status code.
+
+## 7. Configuration
+
+The script uses default paths and settings that can be modified in the source code:
+- Default input/output path: `doc/database.sql`
+- Default maximum line length for INSERT statements: 120 characters

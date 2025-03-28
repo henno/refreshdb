@@ -171,7 +171,7 @@ function restoreDatabase(array $config): void
     }
 
     if (executeCommand(sprintf(
-        '%s -u %s %s -h %s %s < %s',
+        '%s --binary-mode -u %s %s -h %s %s < %s',
         escapeshellcmd($config['mysqlExecutablePath']),
         escapeshellarg($config['databaseUsername']),
         $passwordOption,
