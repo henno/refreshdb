@@ -12,8 +12,8 @@ $config = [
     'configFilePaths' => ['./config.php', './wp-config.php'],
     'dumpFilePath' => 'doc/database.sql',
     'tempFilePath' => 'doc/database.sql.tmp',
-    'mysqlExecutablePath' => '/Applications/MAMP/Library/bin/mysql',
-    'mysqldumpExecutablePath' => '/Applications/MAMP/Library/bin/mysqldump',
+    'mysqlExecutablePath' => 'mysql',
+    'mysqldumpExecutablePath' => 'mysqldump',
     'maxLineLength' => 120,
 ];
 
