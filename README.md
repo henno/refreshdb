@@ -33,8 +33,15 @@ This will:
 
 ## 3. Usage
 
+### Linux/macOS
 ```bash
 php refreshdb.php [--dump | --restore | --repair]
+```
+
+### Windows
+If you installed using the PowerShell script (INSTALL.ps1), you can simply use:
+```cmd
+db [--dump | --restore | --repair]
 ```
 
 You can only use one mode at a time. If no mode is specified, the script will show usage information.
