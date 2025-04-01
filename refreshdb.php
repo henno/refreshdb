@@ -469,7 +469,8 @@ function shouldSkipLine(string $line): bool
         '/^--\s*$/',                    // Empty comment lines (just "--")
         '/^\s*$/',                      // Completely empty lines
         '/^\s*\/\*![0-9]+\s+SET/',      // Lines containing only /*!... SET ...
-        '/\/\*M!999999\\\\- enable the sandbox mode \*\//', // Specific sandbox comment
+        '/\/\*M?!999999\\\- enable the sandbox mode \*\//', // Specific sandbox comment for MariaDB
+        '/\/\*!999999\\\- enable the sandbox mode \*\//', // Specific sandbox comment for MariaDB
         '/DROP TABLE IF EXISTS|DROP DATABASE|CREATE DATABASE|USE\s+`/',
         '/^SET FOREIGN_KEY_CHECKS=0;?$/', // Header added by addHeader function
         '/^SET @@SESSION\.sql_mode=\'NO_AUTO_VALUE_ON_ZERO\';?$/' // Header added by addHeader function
