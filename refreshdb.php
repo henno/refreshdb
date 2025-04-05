@@ -34,14 +34,16 @@ try {
 //-----------------------------
 // Determine Mode
 //-----------------------------
-$options = getopt('', ['dump', 'restore', 'repair']);
+$options = getopt('', ['dump', 'restore', 'repair', 'dump-schema']);
 $mode = isset($options['dump'])
     ? 'dump'
     : (isset($options['restore'])
         ? 'restore'
         : (isset($options['repair'])
             ? 'repair'
-            : 'help'));
+            : (isset($options['dump-schema'])
+                ? 'dump-schema'
+                : 'help')));
 
 if ($mode === 'help') {
     showHelp();
@@ -79,6 +81,8 @@ if ($mode === 'dump') {
     restoreDatabase($config);
 } elseif ($mode === 'repair') {
     repairDumpFile($config);
+} elseif ($mode === 'dump-schema') {
+    dumpSchema($config);
 }
 
 //-----------------------------
@@ -88,18 +92,16 @@ $elapsed = microtime(true) - $start;
 log_message("Time taken: "
     . ($elapsed < 1 ? round($elapsed * 1000) . " ms" : round($elapsed, 2) . " s"));
 
+
 //====================================================
 // FUNCTIONS
 //====================================================
+
 /**
- * Dump the Database
+ * Dump the Database (structure + data), then normalize it.
  */
 function dumpDatabase(array $config): void
 {
-    // Create temp file for raw dump
-    $tmpFile = $config['tempFilePath'];
-
-    // Build mysqldump command
     $passwordOption = empty($config['databasePassword']) ? "" : "-p" . escapeshellarg($config['databasePassword']);
 
     if (executeCommand(sprintf(
@@ -111,6 +113,7 @@ function dumpDatabase(array $config): void
         escapeshellarg($config['databaseName']),
         escapeshellarg($config['dumpFilePath'])
     ))) {
+        // Run our normal line-by-line transformations
         normalizeDumpFile($config);
         logFileStats($config['dumpFilePath']);
     } else {
@@ -119,7 +122,43 @@ function dumpDatabase(array $config): void
 }
 
 /**
- * Repair an existing dump file
+ * Dump only the schema (no data) in a stripped-down form, printed to stdout.
+ * We reuse existing normalization but skip all data logic.
+ */
+function dumpSchema(array $config): void
+{
+    log_message("Dumping minimal schema to stdout ...");
+
+    $passwordOption = empty($config['databasePassword']) ? "" : "-p" . escapeshellarg($config['databasePassword']);
+    $command = sprintf(
+        '%s --no-data --skip-comments -u %s %s -h %s %s > %s',
+        escapeshellcmd($config['mysqldumpExecutablePath']),
+        escapeshellarg($config['databaseUsername']),
+        $passwordOption,
+        escapeshellarg($config['databaseHostname']),
+        escapeshellarg($config['databaseName']),
+        escapeshellarg($config['dumpFilePath'])
+    );
+
+    // Generate a no-data dump
+    if (!executeCommand($command)) {
+        log_message("Failed to create schema dump (no-data).");
+        exit(1);
+    }
+
+    // Now reuse our normalizing logic, but in "schemaOnly" mode
+    normalizeDumpFile($config, /* schemaOnly = */ true);
+
+    // Finally, read the resulting file and echo it to stdout
+    if (file_exists($config['dumpFilePath'])) {
+        echo file_get_contents($config['dumpFilePath']);
+    }
+    // We’re done. No need to keep that file if you don’t want to.
+    exit(0);
+}
+
+/**
+ * Repair an existing dump file (e.g., convert from UTF16 to UTF8) and then normalize.
  */
 function repairDumpFile(array $config): void
 {
@@ -142,11 +181,10 @@ function repairDumpFile(array $config): void
 }
 
 /**
- * Restore the Database
+ * Restore the Database (drops & recreates it, then loads from dump)
  */
 function restoreDatabase(array $config): void
 {
-    // Build a password option
     $passwordOption = empty($config['databasePassword']) ? "" : "-p" . escapeshellarg($config['databasePassword']);
 
     // Drop & create
@@ -159,7 +197,7 @@ function restoreDatabase(array $config): void
         $config['databaseName'],
         $config['databaseName']
     ))) {
-        log_message("Failed to drop and/or create the database.");
+        log_message("Failed to drop/create the database.");
         return;
     }
 
@@ -178,7 +216,11 @@ function restoreDatabase(array $config): void
         escapeshellarg($config['databaseHostname']),
         escapeshellarg($config['databaseName']),
         escapeshellarg($config['dumpFilePath'])
-    ))) log_message("Database restored successfully."); else log_message("Failed to restore the database.");
+    ))) {
+        log_message("Database restored successfully.");
+    } else {
+        log_message("Failed to restore the database.");
+    }
 }
 
 /**
@@ -191,58 +233,46 @@ function readDatabaseCredentials(array &$config): void
             continue;
         }
 
-        // Include the file safely to read constants
         try {
-            // Turn off output buffering to prevent any potential output
             ob_start();
             require $path;
             ob_end_clean();
 
-            // Check for DATABASE_ constants
             if (defined('DATABASE_HOSTNAME')) {
                 $config['databaseHostname'] = DATABASE_HOSTNAME;
             }
-
             if (defined('DATABASE_USERNAME')) {
                 $config['databaseUsername'] = DATABASE_USERNAME;
             }
-
             if (defined('DATABASE_PASSWORD')) {
                 $config['databasePassword'] = DATABASE_PASSWORD;
             }
-
             if (defined('DATABASE_DATABASE')) {
                 $config['databaseName'] = DATABASE_DATABASE;
             }
 
-            // Check for WordPress-style DB_ constants
             if (empty($config['databaseHostname']) && defined('DB_HOST')) {
                 $config['databaseHostname'] = DB_HOST;
             }
-
             if (empty($config['databaseUsername']) && defined('DB_USER')) {
                 $config['databaseUsername'] = DB_USER;
             }
-
             if (empty($config['databasePassword']) && defined('DB_PASSWORD')) {
                 $config['databasePassword'] = DB_PASSWORD;
             }
-
             if (empty($config['databaseName']) && defined('DB_NAME')) {
                 $config['databaseName'] = DB_NAME;
             }
 
-            // If we found all credentials, stop searching
             if (!empty($config['databaseName']) && !empty($config['databaseHostname']) && !empty($config['databaseUsername'])) {
                 break;
             }
         } catch (Throwable $e) {
-            // If there was an error including the file, log it
             log_message("Error reading config file $path: " . $e->getMessage());
         }
     }
 
-    // Fallback for database name if not found in config files
+    // fallback
     if (empty($config['databaseName'])) {
         $config['databaseName'] = basename(getcwd());
     }
@@ -259,16 +289,17 @@ processes dump files to minimize differences when switching between MySQL and
 MariaDB, ensuring consistent output and minimal noise in version control.
 
 Usage:
-  php refreshdb.php [--dump | --restore | --repair]
+  php refreshdb.php [--dump | --restore | --repair | --dump-schema]
 
 Options:
-  --dump      Create a database dump file with transformations applied.
-  --restore   Restore the database from an existing dump file.
-  --repair    Apply normalization rules to an existing dump file without accessing the database.
+  --dump         Create a database dump file with transformations applied.
+  --restore      Restore the database from an existing dump file.
+  --repair       Apply normalization rules to an existing dump file without accessing the database.
+  --dump-schema  Output a very compact schema (no data) to stdout (for LLM context).
 
 Configuration:
   The script will read database credentials from config.php or wp-config.php.
-  You can also customize settings by editing the \$config array in this script.
+  You can also customize settings by editing the \$config array at the top.
 
 HELP;
 }
@@ -288,18 +319,27 @@ function executeCommand(string $command): bool
 }
 
 /**
- * Process Dump File for Consistency (line by line to handle large files)
+ * Determine if a file is UTF16 (by BOM).
  */
-function normalizeDumpFile($config): bool
+function isUtf16(string $sourcePath): bool
 {
-    log_message("Processing dump file for more consistent output...");
+    $firstBytes = file_get_contents($sourcePath, false, null, 0, 2);
+    return ($firstBytes === "\xFF\xFE");
+}
+
+/**
+ * Process Dump File for Consistency (line by line). Also supports a "schemaOnly"
+ * mode that omits headers, inserts, etc.
+ */
+function normalizeDumpFile(array $config, bool $schemaOnly = false): bool
+{
+    log_message("Processing dump file for more consistent output (schemaOnly=" . ($schemaOnly ? 'true' : 'false') . ")...");
 
     if (!file_exists($config['dumpFilePath'])) {
         log_message("Source file does not exist: $config[dumpFilePath]");
         return false;
     }
 
-    // Check if the file is large
     $filesizeInMB = round(filesize($config['dumpFilePath']) / 1024 / 1024, 0);
     if ($filesizeInMB > 50) {
         log_message($config['dumpFilePath'] . " is large: " . $filesizeInMB . " MB");
@@ -318,81 +358,73 @@ function normalizeDumpFile($config): bool
         return false;
     }
 
-    // Add header with current date and host
-    addHeader($targetHandle);
+    // In schemaOnly mode, skip adding custom headers
+    if (!$schemaOnly) {
+        addHeader($targetHandle);
+    }
 
-    // Initialize loop state
     $lineCount = 0;
+    $startTime = microtime(true);
+
+    // Only used if $schemaOnly == false
     $inInsertStatement = false;
     $valueBlocks = [];
     $insertStmt = '';
-    $startTime = microtime(true);
 
-    // Read lines
     while (($line = fgets($sourceHandle)) !== false) {
 
         $lineCount++;
-
         logProgress($lineCount, $startTime);
 
-        // Handle INSERT mode
-        if ($inInsertStatement) {
-
-            // Check if line contains value blocks
+        // If we're not in schemaOnly mode, handle consolidated INSERT logic
+        if (!$schemaOnly && $inInsertStatement) {
             $trimmedLine = trim($line);
-
-            // Check if line contains value blocks (starts with a parenthesis or contains value blocks)
             if (preg_match('/^\s*\(/', $trimmedLine) || preg_match('/\)\s*,\s*\(/', $trimmedLine)) {
-                // Handle multiple value blocks in a single line
                 $parsedBlocks = parseValueBlocks($trimmedLine);
                 if (!empty($parsedBlocks)) {
                     $valueBlocks = array_merge($valueBlocks, $parsedBlocks);
                 }
-
-                // End of VALUES detection
                 if (preg_match('/\);\s*$/', $trimmedLine)) {
                     writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
                     $inInsertStatement = false;
                 }
                 continue;
             }
-
-            // End of INSERT detection
             if (preg_match('/;\s*$/', $trimmedLine) || !preg_match('/^\s*\(/i', $trimmedLine)) {
                 if (!empty($valueBlocks)) {
                     writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
                 }
-
                 $inInsertStatement = false;
                 if (!preg_match('/^\s*;\s*$/', $trimmedLine)) {
                     fwrite($targetHandle, $line);
                 }
                 continue;
             }
-
             continue;
         }
 
-        // Skip lines we don’t want (comments, empties, db statements, etc.)
+        // Skip lines we don’t want
         if (shouldSkipLine($line)) {
             continue;
         }
 
-        // Transform line in various ways (remove DEFINER, AUTO_INCREMENT, etc.)
+        // If schemaOnly, skip any INSERT lines altogether (there shouldn't be any, but just in case)
+        if ($schemaOnly && preg_match('/^INSERT /i', ltrim($line))) {
+            continue;
+        }
+
+        // Transform line in various ways
         $line = transformLine($line);
 
-        // Detect start of an INSERT statement
-        if (preg_match('/^INSERT INTO `([^`]+)`(\s+VALUES|\s+\([^)]+\)\s+VALUES)\s*\(?/', $line, $matches)) {
+        // If not schemaOnly, detect start of an INSERT
+        if (!$schemaOnly && preg_match('/^INSERT INTO `([^`]+)`(\s+VALUES|\s+\([^)]+\)\s+VALUES)\s*\(?/', $line, $matches)) {
             $inInsertStatement = true;
             $insertStmt = "INSERT INTO `{$matches[1]}` VALUES\n";
             $valueBlocks = [];
 
-            // Extract VALUES on same line
             if (preg_match('/VALUES\s*(\(.*)/i', $line, $values)) {
                 $valueStr = rtrim($values[1], " \t\n\r\0\x0B;");
                 $valueBlocks = parseValueBlocks($valueStr);
-
-                // One-liner INSERT
                 if (preg_match('/\);\s*$/', $line)) {
                     writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
                     $inInsertStatement = false;
@@ -401,21 +433,21 @@ function normalizeDumpFile($config): bool
             continue;
         }
 
-        // Write normal line with table spacing
-        if (str_starts_with($line, '-- Table structure for table')) {
+        // Write lines
+        if (!$schemaOnly && str_starts_with($line, '-- Table structure for table')) {
             fwrite($targetHandle, "\n");
         }
         fwrite($targetHandle, $line);
     }
 
-    // Handle any remaining INSERT data
-    if ($inInsertStatement && !empty($valueBlocks)) {
+    // Handle any trailing INSERT data if we ended in the middle
+    if (!$schemaOnly && $inInsertStatement && !empty($valueBlocks)) {
         writeConsolidatedInsert($targetHandle, $insertStmt, $valueBlocks);
     }
 
-    // Cleanup
     fclose($sourceHandle);
     fclose($targetHandle);
+
     rename($config['tempFilePath'], $config['dumpFilePath']);
     log_message("Processed $lineCount lines total");
 
@@ -423,22 +455,7 @@ function normalizeDumpFile($config): bool
 }
 
 /**
- * @param int $lineCount
- * @param float $startTime
- * @return void
- */
-function logProgress(int $lineCount, float $startTime): void
-{
-    if ($lineCount % 20000 === 0) {
-        $elapsed = microtime(true) - $startTime;
-        $rate = $lineCount / $elapsed;
-        log_message(sprintf("Processed %d lines... (%.1f lines/sec)", $lineCount, $rate));
-    }
-}
-
-/**
- * @param $targetHandle
- * @return void
+ * Optional: add a simple header line to the top (skipped when schemaOnly=true).
  */
 function addHeader($targetHandle): void
 {
@@ -448,32 +465,20 @@ function addHeader($targetHandle): void
 }
 
 /**
- * @param string $sourcePath
- * @return bool
- */
-function isUtf16(string $sourcePath): bool
-{
-    $firstBytes = file_get_contents($sourcePath, false, null, 0, 2);
-    $isUtf16le = ($firstBytes === "\xFF\xFE");
-    return $isUtf16le;
-}
-
-/**
- * Helper: Check if line should be skipped.
+ * Check if we should skip an entire line altogether
  */
 function shouldSkipLine(string $line): bool
 {
     $patterns = [
         '/^-- (MySQL dump|Dump|Server version|Dump completed on|MariaDB dump|Host:|Current Database:|Dump created on)/',
-        '/^-- -{10,}/',                 // Separator lines like "-- ---------"
-        '/^--\s*$/',                    // Empty comment lines (just "--")
-        '/^\s*$/',                      // Completely empty lines
-        '/^\s*\/\*![0-9]+\s+SET/',      // Lines containing only /*!... SET ...
-        '/\/\*M?!999999\\\- enable the sandbox mode \*\//', // Specific sandbox comment for MariaDB
-        '/\/\*!999999\\\- enable the sandbox mode \*\//', // Specific sandbox comment for MariaDB
+        '/^-- -{10,}/',                // lines like "-- ---------"
+        '/^--\s*$/',                   // just "--"
+        '/^\s*$/',                     // blank line
+        '/^\s*\/\*![0-9]+\s+SET/',     // e.g., "/*!40101 SET..."
+        '/\/\*M!999999\\\\- enable the sandbox mode \*\//',
         '/DROP TABLE IF EXISTS|DROP DATABASE|CREATE DATABASE|USE\s+`/',
-        '/^SET FOREIGN_KEY_CHECKS=0;?$/', // Header added by addHeader function
-        '/^SET @@SESSION\.sql_mode=\'NO_AUTO_VALUE_ON_ZERO\';?$/' // Header added by addHeader function
+        '/^SET FOREIGN_KEY_CHECKS=0;?$/',
+        '/^SET @@SESSION\.sql_mode=\'NO_AUTO_VALUE_ON_ZERO\';?$/'
     ];
 
     foreach ($patterns as $pattern) {
@@ -481,87 +486,67 @@ function shouldSkipLine(string $line): bool
             return true;
         }
     }
-
     return false;
 }
 
 /**
- * Helper: Transform line by applying replacements/removals
+ * Transform a single line by removing or replacing certain things
  */
 function transformLine(string $line): string
 {
     $replacements = [
-        '/DEFINER=`[^`]+`@`[^`]+`\s*/' => '',         // Remove DEFINER clauses
-        '/\s+AUTO_INCREMENT=\d+/' => '',         // Remove AUTO_INCREMENT
-        '/\butf8\b/' => 'utf8mb4',  // Replace utf8 with utf8mb4 (whole word only)
-        '/\b(tiny|small|medium|big)?int\(\d+\)/' => '$1int',    // Convert int(N) to int, tinyint(N) to tinyint, etc.
-        '/\s+COLLATE\s+[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',         // Remove COLLATE in column definitions
-        '/\s+COLLATE\s*=\s*[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',         // Remove COLLATE in table definitions
-        '/(=\s*)(\'(\d+(\.\d+)?)\')/i' => '$1$3',     // Remove quotes from numeric literals
+        '/DEFINER=`[^`]+`@`[^`]+`\s*/' => '',            // Remove DEFINER clauses
+        '/\s+AUTO_INCREMENT=\d+/' => '',                // Remove AUTO_INCREMENT
+        '/\butf8\b/' => 'utf8mb4',                      // Replace utf8 with utf8mb4
+        '/\b(tiny|small|medium|big)?int\(\d+\)/' => '$1int', // int(11)->int, etc.
+        '/\s+COLLATE\s+[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',  // remove collate
+        '/\s+COLLATE\s*=\s*[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',
+        '/(=\s*)(\'(\d+(\.\d+)?)\')/i' => '$1$3',       // remove numeric quotes
     ];
+
+    // Remove engine info, charset, etc. from CREATE TABLE, if present
+    $line = preg_replace('/ENGINE\s*=\s*\S+/i', '', $line);
+    $line = preg_replace('/\bDEFAULT\s+CHARSET\s*=\s*\S+/i', '', $line);
+    $line = preg_replace('/\bCHARSET\s*=\s*\S+/i', '', $line);
+    $line = preg_replace('/ROW_FORMAT\s*=\s*\S+/i', '', $line);
 
     foreach ($replacements as $pattern => $replacement) {
         $line = preg_replace($pattern, $replacement, $line);
     }
 
+    // Clean up extra spaces left behind
+    $line = trim(preg_replace('/\s+/', ' ', $line));
+
+    if ($line !== '') {
+        $line .= "\n"; // restore a newline
+    }
     return $line;
 }
 
 /**
- * Helper: Parse multiple value blocks from a chunk like
- * "(1,'abc'),(2,'xyz'),(3,'foo')..."
+ * Parse multiple value blocks from lines like: (1,'abc'),(2,'xyz'),(3,'foo')
  */
 function parseValueBlocks(string $lineFragment): array
 {
     $blocks = [];
-    $lineFragment = trim($lineFragment);
+    $lineFragment = rtrim(trim($lineFragment), ',;');
 
-    // Remove any trailing semicolon or comma
-    $lineFragment = rtrim($lineFragment, ',;');
-
-    // If we see multiple row blocks in one string => split them
+    // If multiple row blocks in one string => split them
     if (str_contains($lineFragment, '),(')) {
         $parts = preg_split('/\),\s*\(/', $lineFragment);
         foreach ($parts as $i => $part) {
-            $part = trim($part);
-
-            // Remove any trailing commas first
-            $part = rtrim($part, ',');
-
+            $part = rtrim(trim($part), ',');
             // Add missing parentheses
-            if ($i === 0) {
-                // The First part - it may already have opening parenthesis
-                if (!str_starts_with($part, '(')) {
-                    $part = '(' . $part;
-                }
-                // Add closing parenthesis if missing
-                if (!str_ends_with($part, ')')) {
-                    $part .= ')';
-                }
-            } elseif ($i === count($parts) - 1) {
-                // Last part - add opening and closing if missing
-                if (!str_starts_with($part, '(')) {
-                    $part = '(' . $part;
-                }
-                if (!str_ends_with($part, ')')) {
-                    $part .= ')';
-                }
-            } else {
-                // Middle parts - always need both parentheses
-                if (!str_starts_with($part, '(')) {
-                    $part = '(' . $part;
-                }
-                if (!str_ends_with($part, ')')) {
-                    $part .= ')';
-                }
+            if (!str_starts_with($part, '(')) {
+                $part = '(' . $part;
+            }
+            if (!str_ends_with($part, ')')) {
+                $part .= ')';
             }
             $blocks[] = $part;
         }
     } else {
         // Single row block
-        $lineFragment = rtrim($lineFragment, ',;');
-
-        // Ensure it has opening and closing parentheses
         if (!str_starts_with($lineFragment, '(')) {
             $lineFragment = '(' . $lineFragment;
         }
@@ -574,8 +559,7 @@ function parseValueBlocks(string $lineFragment): array
 }
 
 /**
- * Helper: Consolidate values into lines respecting maxLineLength, then write the
- * consolidated INSERT statement to $targetHandle.
+ * Consolidate multi-line INSERT blocks respecting maxLineLength
  */
 function writeConsolidatedInsert($targetHandle, string $insertHeader, array $valuesBuffer): void
 {
@@ -588,8 +572,7 @@ function writeConsolidatedInsert($targetHandle, string $insertHeader, array $val
     $maxLineLength = $config['maxLineLength'];
 
     foreach ($valuesBuffer as $valueBlock) {
-        // Remove trailing comma if present to prevent double commas
-        $valueBlock = rtrim($valueBlock, ",");
+        $valueBlock = rtrim($valueBlock, ","); // remove trailing comma
 
         if (strlen($currentValueLine . $valueBlock) > $maxLineLength) {
             if (!empty($currentValueLine)) {
@@ -607,23 +590,19 @@ function writeConsolidatedInsert($targetHandle, string $insertHeader, array $val
         $consolidatedValues[] = $currentValueLine;
     }
 
-    // When we join the lines, we need to make sure the last line in each group
-    // doesn't have a trailing comma, which would create the ",)" pattern
-    if (!empty($consolidatedValues)) {
-        for ($i = 0; $i < count($consolidatedValues) - 1; $i++) {
-            if (!str_ends_with($consolidatedValues[$i], ",")) {
-                $consolidatedValues[$i] .= ",";
-            }
+    // Ensure trailing commas are trimmed
+    for ($i = 0; $i < count($consolidatedValues) - 1; $i++) {
+        if (!str_ends_with($consolidatedValues[$i], ",")) {
+            $consolidatedValues[$i] .= ",";
         }
-        // Make sure the last item doesn't have a trailing comma
+    }
+    if (!empty($consolidatedValues)) {
         $consolidatedValues[count($consolidatedValues) - 1] = rtrim($consolidatedValues[count($consolidatedValues) - 1], ",");
     }
 
     fwrite($targetHandle, implode("\n", $consolidatedValues));
-
-    // Ensure we end with a semicolon
     $lastValue = end($consolidatedValues);
-    if (substr($lastValue, -1) === ';') {
+    if (str_ends_with($lastValue, ';')) {
         fwrite($targetHandle, "\n");
     } else {
         fwrite($targetHandle, ";\n");
@@ -631,7 +610,7 @@ function writeConsolidatedInsert($targetHandle, string $insertHeader, array $val
 }
 
 /**
- * Log a message
+ * Log a message with elapsed time
  */
 function log_message($message): void
 {
@@ -641,7 +620,7 @@ function log_message($message): void
 }
 
 /**
- * Format bytes to human-readable form and log file statistics
+ * Log file stats: path & size
  */
 function logFileStats(string $filePath): void
 {
@@ -649,7 +628,6 @@ function logFileStats(string $filePath): void
         log_message("File not found: $filePath");
         return;
     }
-
     $size = filesize($filePath);
     log_message("Database file statistics:");
     log_message("- Path: $filePath");
@@ -657,17 +635,26 @@ function logFileStats(string $filePath): void
 }
 
 /**
- * Format bytes to human-readable form
+ * Byte size to human-readable form
  */
 function formatBytes(int $bytes, int $precision = 2): string
 {
     $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-
     $bytes = max($bytes, 0);
     $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
     $pow = min($pow, count($units) - 1);
-
     $bytes /= (1 << (10 * $pow));
-
     return round($bytes, $precision) . ' ' . $units[$pow];
+}
+
+/**
+ * Show line processing progress occasionally
+ */
+function logProgress(int $lineCount, float $startTime): void
+{
+    if ($lineCount % 20000 === 0) {
+        $elapsed = microtime(true) - $startTime;
+        $rate = $lineCount / $elapsed;
+        log_message(sprintf("Processed %d lines... (%.1f lines/sec)", $lineCount, $rate));
+    }
 }
