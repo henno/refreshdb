@@ -475,7 +475,8 @@ function shouldSkipLine(string $line): bool
         '/^--\s*$/',                   // just "--"
         '/^\s*$/',                     // blank line
         '/^\s*\/\*![0-9]+\s+SET/',     // e.g., "/*!40101 SET..."
-        '/\/\*M!999999\\\\- enable the sandbox mode \*\//',
+        '/\/\*M?!999999\\\- enable the sandbox mode \*\//',
+        '/\/\*!999999\\\- enable the sandbox mode \*\//',
         '/DROP TABLE IF EXISTS|DROP DATABASE|CREATE DATABASE|USE\s+`/',
         '/^SET FOREIGN_KEY_CHECKS=0;?$/',
         '/^SET @@SESSION\.sql_mode=\'NO_AUTO_VALUE_ON_ZERO\';?$/'
