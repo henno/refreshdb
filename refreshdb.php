@@ -449,6 +449,65 @@ function normalizeDumpFile(array $config, bool $schemaOnly = false): bool
     fclose($targetHandle);
 
     rename($config['tempFilePath'], $config['dumpFilePath']);
+    
+    // For large files, apply a line-by-line processing approach that uses minimal memory
+    $tempFinalFix = $config['dumpFilePath'] . '.finalfix';
+    
+    // Open the source and destination files
+    $sourceFile = fopen($config['dumpFilePath'], 'r');
+    $destFile = fopen($tempFinalFix, 'w');
+    
+    if (!$sourceFile || !$destFile) {
+        log_message("Failed to open file for post-processing");
+        return false;
+    }
+    
+    // Process line by line
+    $inCreateTable = false;
+    
+    while (($line = fgets($sourceFile)) !== false) {
+        // Detect start of the CREATE TABLE statement
+        if (preg_match('/^\s*CREATE\s+TABLE\s+/i', $line)) {
+            $inCreateTable = true;
+        }
+        
+        // If we're inside a CREATE TABLE and line appears to contain a semicolon not at the end
+        if ($inCreateTable && preg_match('/;/', $line) && !preg_match('/;$/', trim($line))) {
+            // Replace semicolons with commas (only inside create table and not at end of line)
+            $line = str_replace(';', ',', $line);
+        }
+        
+        // If this is the line that closes the CREATE TABLE definition
+        if ($inCreateTable && preg_match('/\)\s*(ENGINE.*)?$/i', $line)) {
+            // Process engine, charset removal
+            $line = preg_replace('/ENGINE\s*=\s*\S+/i', '', $line);
+            $line = preg_replace('/\bDEFAULT\s+CHARSET\s*=\s*\S+/i', '', $line);
+            $line = preg_replace('/\bCHARSET\s*=\s*\S+/i', '', $line);
+            $line = preg_replace('/ROW_FORMAT\s*=\s*\S+/i', '', $line);
+            
+            // Ensure line ends with ');\n'
+            $line = rtrim($line);
+            if (str_ends_with($line, ')')) {
+                $line .= ";\n";
+            } elseif (!str_ends_with($line, ');')) {
+                $line = preg_replace('/\)\s*.*$/', ");\n", $line);
+            } else {
+                $line .= "\n";
+            }
+            
+            $inCreateTable = false;
+        }
+        
+        fwrite($destFile, $line);
+    }
+    
+    // Close files
+    fclose($sourceFile);
+    fclose($destFile);
+    
+    // Replace original with a fixed version
+    rename($tempFinalFix, $config['dumpFilePath']);
+    
     log_message("Processed $lineCount lines total");
 
     return true;
@@ -496,6 +555,10 @@ function shouldSkipLine(string $line): bool
  */
 function transformLine(string $line): string
 {
+    // Do not use static variables here as they might persist
+    // across different file processings and cause issues
+    
+    // Apply our basic replacements first
     $replacements = [
         '/DEFINER=`[^`]+`@`[^`]+`\s*/' => '',            // Remove DEFINER clauses
         '/\s+AUTO_INCREMENT=\d+/' => '',                // Remove AUTO_INCREMENT
@@ -505,23 +568,64 @@ function transformLine(string $line): string
         '/\s+COLLATE\s*=\s*[\'"]?[a-zA-Z0-9_]+[\'"]?/' => '',
         '/(=\s*)(\'(\d+(\.\d+)?)\')/i' => '$1$3',       // remove numeric quotes
     ];
-
-    // Remove engine info, charset, etc. from CREATE TABLE, if present
-    $line = preg_replace('/ENGINE\s*=\s*\S+/i', '', $line);
-    $line = preg_replace('/\bDEFAULT\s+CHARSET\s*=\s*\S+/i', '', $line);
-    $line = preg_replace('/\bCHARSET\s*=\s*\S+/i', '', $line);
-    $line = preg_replace('/ROW_FORMAT\s*=\s*\S+/i', '', $line);
-
+    
+    // Is this a complete CREATE TABLE statement on a single line?
+    $isCompleteCREATE = preg_match('/^\s*CREATE\s+TABLE\s+.*\)\s*;?\s*$/is', $line);
+    
+    if ($isCompleteCREATE) {
+        // This is a complete CREATE TABLE statement
+        
+        // Remove engine info, charset, etc. from CREATE TABLE, if present
+        $line = preg_replace('/ENGINE\s*=\s*\S+/i', '', $line);
+        $line = preg_replace('/\bDEFAULT\s+CHARSET\s*=\s*\S+/i', '', $line);
+        $line = preg_replace('/\bCHARSET\s*=\s*\S+/i', '', $line);
+        $line = preg_replace('/ROW_FORMAT\s*=\s*\S+/i', '', $line);
+        
+        // Apply other replacements
+        foreach ($replacements as $pattern => $replacement) {
+            $line = preg_replace($pattern, $replacement, $line);
+        }
+        
+        // Ensure it ends with a semicolon
+        $line = rtrim(trim($line), ';') . ";\n";
+        return $line;
+    }
+    
+    // Handle regular lines
+    $hasSemicolon = str_ends_with(trim($line), ';');
+    
+    // Apply our standard replacements
     foreach ($replacements as $pattern => $replacement) {
         $line = preg_replace($pattern, $replacement, $line);
     }
-
-    // Clean up extra spaces left behind
-    $line = trim(preg_replace('/\s+/', ' ', $line));
-
-    if ($line !== '') {
-        $line .= "\n"; // restore a newline
+    
+    // If it's a CREATE TABLE line, don't add a semicolon as it's only the start
+    if (preg_match('/^\s*CREATE\s+TABLE\s+/i', $line)) {
+        // Don't add a semicolon, this is just the start of CREATE TABLE
+    } 
+    // For lines ending with ')', check if it might be the end of CREATE TABLE
+    else if (preg_match('/\)\s*;?\s*$/', trim($line))) {
+        // This might be the end of a CREATE TABLE statement
+        // Remove any engine info
+        $line = preg_replace('/ENGINE\s*=\s*\S+/i', '', $line);
+        $line = preg_replace('/\bDEFAULT\s+CHARSET\s*=\s*\S+/i', '', $line);
+        $line = preg_replace('/\bCHARSET\s*=\s*\S+/i', '', $line);
+        $line = preg_replace('/ROW_FORMAT\s*=\s*\S+/i', '', $line);
+        
+        // Ensure it ends with a semicolon
+        $line = rtrim(trim($line), ';') . ";\n";
+        return $line;
     }
+    // If it had a semicolon, make sure it still has one
+    else if ($hasSemicolon && !str_ends_with(trim($line), ';')) {
+        $line = trim($line) . ";\n";
+        return $line;
+    }
+    
+    if (trim($line) !== '') {
+        $line = trim($line) . "\n"; // restore a newline
+    }
+    
     return $line;
 }
 
